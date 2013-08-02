@@ -127,28 +127,52 @@ case $date_binary in
 esac
 }
 
+get_current_epoch()
+{
+#based on the date_binary variable, the case statement below will determine the method to use to determine "date_current_epoch" in the future
+case $date_binary in
+	linux-gnu) echo `date +%s` ;;
+	osx-posix) echo `date "+%s"` ;;
+	*) echo `date +%s` ;;
+esac
+}
+
 purge_EBS_Snapshots()
 {
 	#snapshot_tag_list is a string that contains all snapshots with either the key PurgeAllow or PurgeAfter set
-	snapshot_tag_list=`ec2-describe-tags --show-empty-fields --region $region --filter resource-type=snapshot --filter key=PurgeAllow,PurgeAfter,PurgeEpoch`
+	snapshot_tag_list=`ec2-describe-tags --show-empty-fields --region $region --filter resource-type=snapshot --filter key=PurgeAllow,PurgeEpoch,PurgeAfter`
 	#snapshot_purge_allowed is a list of all snapshot_ids with PurgeAllow=true
 	snapshot_purge_allowed=`echo "$snapshot_tag_list" | grep .*PurgeAllow'\s'true | cut -f 3`
 	
 	for snapshot_id_evaluated in $snapshot_purge_allowed
 	do
-		echo "Checking Purge Eligibility for Snapshot: $snapshot_id_evaluated";
+
+		#gets the "PurgeEpoch" date which is set optionally (-e EPOCH) to allow finer-grained purge control (eg. older than an hour, etc.)
+		purge_epoch=`echo "$snapshot_tag_list" | grep .*$snapshot_id_evaluated'\s'PurgeEpoch.* | cut -f 5`
+		#if purge_epoch is not set then we have a problem. Need to alert user.
+		if [[ -z $purge_epoch ]]
+			then echo "$snapshot_id_evaluated not eligible to purge."
+		else
+			#convert both the date_current and purge_after_date into epoch time to allow for comparison
+			date_current_epoch=`get_current_epoch`
+			#perform comparison - if $purge_epoch is a lower number than $date_current_epoch than the PurgeEpoch timestamp is earlier than the current date - and the snapshot can be safely removed
+			if [[ $purge_epoch < $date_current_epoch ]]
+				then
+				echo "The snapshot \"$snapshot_id_evaluated\" with the PurgeEpoch timestamp of $purge_epoch will be deleted."
+				ec2-delete-snapshot --region $region $snapshot_id_evaluated
+				echo "Purge Complete for $snapshot_id_evaluated" 
+				continue
+			fi
+		fi
+
+
+
 		#gets the "PurgeAfter" date which is in UTC with YYYY-MM-DD format (or %Y-%m-%d)
 		purge_after_date=`echo "$snapshot_tag_list" | grep .*$snapshot_id_evaluated'\s'PurgeAfter.* | cut -f 5`
-		echo -n "--> Looking for PurgeAfter Date: "
 		#if purge_after_date is not set then we have a problem. Need to alert user.
 		if [[ -z $purge_after_date ]]
-			#Alerts user to the fact that a Snapshot was found with PurgeAllow=true but with no PurgeAfter date.
-			then echo "None!"
-			echo 
-			echo "A Snapshot with the Snapshot ID $snapshot_id_evaluated has the tag \"PurgeAllow=true\" but does not have a \"PurgeAfter=YYYY-MM-DD\" date. $app_name is unable to determine if $snapshot_id_evaluated should be purged." 1>&2
+			then echo "$snapshot_id_evaluated not eligible to purge."
 		else
-			echo $purge_after_date
-			echo
 			#convert both the date_current and purge_after_date into epoch time to allow for comparison
 			date_current_epoch=`get_date_current_epoch`
 			purge_after_date_epoch=`get_purge_after_date_epoch`
@@ -158,33 +182,10 @@ purge_EBS_Snapshots()
 				echo "The snapshot \"$snapshot_id_evaluated\" with the Purge After date of $purge_after_date will be deleted."
 				ec2-delete-snapshot --region $region $snapshot_id_evaluated
 				echo "Purge Complete for $snapshot_id_evaluated"
+				continue
 			fi
-		continue
 		fi
 
-		#gets the "PurgeEpoch" date which is set optionally (-e EPOCH) to allow finer-grained purge control (eg. older than an hour, etc.)
-		purge_epoch=`echo "$snapshot_tag_list" | grep .*$snapshot_id_evaluated'\s'PurgeEpoch.* | cut -f 5`
-		echo -n "--> Looking for PurgeEpoch Date: "
-		#if purge_epoch is not set then we have a problem. Need to alert user.
-		if [[ -z $purge_epoch ]]
-			#Alerts user to the fact that a Snapshot was found with PurgeAllow=true but with no PurgeEpoch timestamp.
-			then echo "None!"
-			echo 
-			echo "A Snapshot with the Snapshot ID $snapshot_id_evaluated has the tag key \"PurgeEpoch\" but does not have a value. $app_name is unable to determine if $snapshot_id_evaluated should be purged. Value: $purge_epoch" 1>&2
-		else
-			echo $purge_epoch
-			echo
-			#convert both the date_current and purge_after_date into epoch time to allow for comparison
-			date_current_epoch=`get_date_current_epoch`
-			#perform comparison - if $purge_epoch is a lower number than $date_current_epoch than the PurgeEpoch timestamp is earlier than the current date - and the snapshot can be safely removed
-			if [[ $purge_epoch < $date_current_epoch ]]
-				then
-				echo "The snapshot \"$snapshot_id_evaluated\" with the PurgeEpoch timestamp of $purge_epoch will be deleted."
-				ec2-delete-snapshot --region $region $snapshot_id_evaluated
-				echo "Purge Complete for $snapshot_id_evaluated" 
-			fi
-		continue
-		fi
 	done
 }
 
@@ -203,7 +204,9 @@ user_tags=false
 #sets the Purge Snapshot feature to false - this feature will eventually allow the removal of snapshots that have a "PurgeAfter" tag that is earlier than current date
 purge_snapshots=false
 #handles options processing
-while getopts :s:c:r:v:t:k:e:pnu opt
+purge_only=false
+
+while getopts :s:c:r:v:t:k:e:pxnu opt
 	do
 		case $opt in
 			s) selection_method="$OPTARG";;
@@ -213,12 +216,14 @@ while getopts :s:c:r:v:t:k:e:pnu opt
 			t) tag="$OPTARG";;
 			k) purge_after_days="$OPTARG";;
 			e) purge_after_epoch="$OPTARG";;
-			n) name_tag_create=true;;
 			p) purge_snapshots=true;;
+			x) purge_only=true;;
+			n) name_tag_create=true;;
 			u) user_tags=true;;
 			*) echo "Error with Options Input. Cause of failure is most likely that an unsupported parameter was passed or a parameter was passed without a corresponding option." 1>&2 ; exit 64;;
 		esac
 	done
+
 
 #sources "cron_primer" file for running under cron or other restricted environments - this file should contain the variables and environment configuration required for ec2-automate-backup to run correctly
 if [[ -n $cron_primer ]]
@@ -260,7 +265,11 @@ if [[ -n $purge_after_days ]]
 	echo 
 fi
 
-
+if $purge_only 
+	then echo "Only Purging Snapshots" 
+	purge_EBS_Snapshots
+	exit 0
+fi
 
 #get_EBS_List gets a list of EBS instances for which a snapshot is desired. The list of EBS instances depends upon the selection_method that is provided by user input
 get_EBS_List
